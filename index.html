@@ -148,13 +148,33 @@ const sendJog   = (x,y) => send(new Uint8Array([4, x&255, y&255, turbo?1:0]));
 async function connect(){
   try{
     device=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
-    device.addEventListener('gattserverdisconnected',()=>{ cmdChar=null; staChar=null; tracking=false; setLink('disconnected'); updateButtons(); });
-    setLink('connecting…');
-    const server=await device.gatt.connect();
-    const svc=await server.getPrimaryService(SVC);
-    cmdChar=await svc.getCharacteristic(CMD);
-    staChar=await svc.getCharacteristic(STA);
-    await staChar.startNotifications();
+    let connecting=true;
+    device.addEventListener('gattserverdisconnected',()=>{
+      cmdChar=null; staChar=null; tracking=false;
+      if(!connecting) setLink('disconnected');
+      updateButtons();
+    });
+    // Android often drops the link right after connect or serves stale cached services,
+    // so settle briefly and retry the whole sequence a few times.
+    let ok=false, lastErr=null;
+    for(let i=1;i<=4 && !ok;i++){
+      try{
+        setLink(`connecting… (try ${i})`);
+        const server=await device.gatt.connect();
+        await new Promise(r=>setTimeout(r,600));
+        const svc=await server.getPrimaryService(SVC);
+        cmdChar=await svc.getCharacteristic(CMD);
+        staChar=await svc.getCharacteristic(STA);
+        await staChar.startNotifications();
+        ok=true;
+      }catch(e){
+        lastErr=e; cmdChar=null; staChar=null;
+        try{ device.gatt.disconnect(); }catch(_){}
+        await new Promise(r=>setTimeout(r,800));
+      }
+    }
+    connecting=false;
+    if(!ok) throw lastErr;
     staChar.addEventListener('characteristicvaluechanged',e=>{
       const v=e.target.value;
       if(v.byteLength>=11 && v.getUint8(0)===0x80){

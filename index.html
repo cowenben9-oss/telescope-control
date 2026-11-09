@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telescope Control</title>
+<style>
+  :root { --bg:#0b0000; --panel:#1a0505; --line:#4a1212; --fg:#ff8a80; --dim:#a24a44; --accent:#ff4d3d; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:12px 16px 40px; background:var(--bg); color:var(--fg);
+         font:15px/1.4 system-ui, sans-serif; max-width:520px; margin-inline:auto; }
+  h1 { font-size:18px; margin:4px 0 12px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 8px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  button, select, input { font:inherit; color:var(--fg); background:#2a0a0a; border:1px solid var(--line);
+         border-radius:8px; padding:10px 12px; }
+  button { cursor:pointer; touch-action:manipulation; }
+  button.primary { background:var(--accent); color:#1a0000; border-color:var(--accent); font-weight:600; }
+  button.on { background:var(--accent); color:#1a0000; }
+  button:disabled { opacity:.4; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
+  .row > * { flex:1 1 auto; }
+  .grid { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-variant-numeric:tabular-nums; }
+  .grid span:nth-child(odd) { color:var(--dim); }
+  .pad { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; max-width:260px; margin:8px auto; }
+  .pad button { padding:18px 0; font-size:22px; user-select:none; -webkit-user-select:none; }
+  small { color:var(--dim); }
+  .warn { color:#ffd180; }
+  input[type=range] { width:100%; padding:0; }
+  input[type=number] { width:100px; }
+</style>
+</head>
+<body>
+<h1>Telescope Control</h1>
+
+<section>
+  <h2>Connection</h2>
+  <div class="row">
+    <button id="btnConnect" class="primary">Connect BLE</button>
+    <button id="btnSensors">Start sensors</button>
+  </div>
+  <div class="grid">
+    <span>Link</span><span id="stLink">disconnected</span>
+    <span>Location</span><span id="stLoc">waiting…</span>
+    <span>UTC</span><span id="stTime">–</span>
+    <span>Phone az / alt</span><span id="stAtt">–</span>
+    <span>Scope az / alt</span><span id="stEst">–</span>
+    <span>Mode</span><span id="stMode">–</span>
+  </div>
+</section>
+
+<section>
+  <h2>Phone mounting</h2>
+  <div class="row">
+    <label>Tube axis in phone frame
+      <select id="axis">
+        <option value="+Y">+Y (top edge points along tube)</option>
+        <option value="-Y">−Y (bottom edge)</option>
+        <option value="-Z">−Z (back of phone, like a camera)</option>
+        <option value="+Z">+Z (screen side)</option>
+        <option value="+X">+X (right edge)</option>
+        <option value="-X">−X (left edge)</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label>Magnetic declination (° east)
+      <input id="decl" type="number" step="0.1" value="0">
+    </label>
+  </div>
+  <small>Pointing the phone at a known direction should read the right alt. Azimuth is magnetic and will drift near the motors, so align with a target (below).</small>
+</section>
+
+<section>
+  <h2>Jog</h2>
+  <div class="pad">
+    <span></span><button data-x="0" data-y="1">▲</button><span></span>
+    <button data-x="-1" data-y="0">◀</button><button id="btnTurbo">TURBO</button><button data-x="1" data-y="0">▶</button>
+    <span></span><button data-x="0" data-y="-1">▼</button><span></span>
+  </div>
+  <div class="row"><label style="width:100%">Jog speed <span id="jogPct">50</span>%
+    <input id="jogSpeed" type="range" min="5" max="100" value="50"></label></div>
+  <small>◀▶ = azimuth, ▲▼ = altitude. Hold to move.</small>
+</section>
+
+<section>
+  <h2>Target</h2>
+  <div class="row">
+    <select id="body">
+      <option>Moon</option><option>Venus</option><option>Mars</option>
+      <option>Jupiter</option><option>Saturn</option><option value="manual">Manual alt/az</option>
+    </select>
+  </div>
+  <div class="row" id="manualRow" hidden>
+    <label>Az° <input id="mAz" type="number" step="0.1" value="180"></label>
+    <label>Alt° <input id="mAlt" type="number" step="0.1" value="45"></label>
+  </div>
+  <div class="grid" style="margin-bottom:8px">
+    <span>Target az / alt</span><span id="stTgt">–</span>
+    <span>Sun separation</span><span id="stSun">–</span>
+  </div>
+  <div class="row">
+    <button id="btnAlign">Align: scope is centred on target</button>
+  </div>
+  <div class="row">
+    <button id="btnSyncPhone">Sync scope to phone attitude</button>
+  </div>
+  <div class="row">
+    <button id="btnTrack" class="primary">Start tracking</button>
+    <button id="btnStop">Stop</button>
+  </div>
+  <small class="warn">Never point at the Sun without a proper solar filter. Tracking refuses targets within 15° of the Sun.</small>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/astronomy-engine@2.1.19/astronomy.browser.min.js"></script>
+<script>
+const SVC='b7a10001-5c1e-4f0a-9a3b-7e1d2c3f4a55';
+const CMD='b7a10002-5c1e-4f0a-9a3b-7e1d2c3f4a55';
+const STA='b7a10003-5c1e-4f0a-9a3b-7e1d2c3f4a55';
+const R2D=180/Math.PI, D2R=Math.PI/180;
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const wrap180=a=>{a%=360; if(a>180)a-=360; if(a<-180)a+=360; return a;};
+
+let device=null, cmdChar=null, staChar=null;
+let loc=null, att={ok:false,az:0,alt:0}, est=null, tracking=false, wakeLock=null;
+let turbo=false, jogTimer=null;
+
+// ---------- BLE ----------
+let busy=false; const queue=[];
+async function send(buf, critical=false){
+  if(!cmdChar) return;
+  if(busy){ if(critical) queue.push(buf); return; }
+  busy=true;
+  try{ await cmdChar.writeValueWithoutResponse(buf); }catch(e){ console.warn('write failed',e); }
+  busy=false;
+  if(queue.length) send(queue.shift(), true);
+}
+const f32=(...vals)=>{ const dv=new DataView(new ArrayBuffer(vals.length*4)); vals.forEach((v,i)=>dv.setFloat32(i*4,v,true)); return new Uint8Array(dv.buffer); };
+const pkt=(type, body=new Uint8Array(0))=>{ const o=new Uint8Array(1+body.length); o[0]=type; o.set(body,1); return o; };
+
+const sendMode  = m => send(pkt(1,new Uint8Array([m])), true);
+const sendTarget= t => send(pkt(2,f32(t.az,t.alt,t.azRate,t.altRate)), true);
+const sendAtt   = () => send(pkt(3,f32(att.az,att.alt)));
+const sendSync  = (az,alt) => send(pkt(5,f32(az,alt)), true);
+const sendJog   = (x,y) => send(new Uint8Array([4, x&255, y&255, turbo?1:0]));
+
+async function connect(){
+  try{
+    device=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
+    device.addEventListener('gattserverdisconnected',()=>{ cmdChar=null; staChar=null; tracking=false; setLink('disconnected'); updateButtons(); });
+    setLink('connecting…');
+    const server=await device.gatt.connect();
+    const svc=await server.getPrimaryService(SVC);
+    cmdChar=await svc.getCharacteristic(CMD);
+    staChar=await svc.getCharacteristic(STA);
+    await staChar.startNotifications();
+    staChar.addEventListener('characteristicvaluechanged',e=>{
+      const v=e.target.value;
+      if(v.byteLength>=11 && v.getUint8(0)===0x80){
+        est={az:v.getFloat32(1,true), alt:v.getFloat32(5,true), mode:v.getUint8(9), synced:!!(v.getUint8(10)&1)};
+      }
+    });
+    setLink('connected: '+(device.name||'Telescope'));
+    try{ wakeLock=await navigator.wakeLock.request('screen'); }catch(e){}
+    if(!att.ok) startSensors();
+  }catch(e){ setLink('error: '+e.message); }
+  updateButtons();
+}
+function setLink(t){ $('stLink').textContent=t; }
+
+// ---------- Sensors ----------
+const AXES={'+Y':[0,1,0],'-Y':[0,-1,0],'+X':[1,0,0],'-X':[-1,0,0],'+Z':[0,0,1],'-Z':[0,0,-1]};
+function qRotate(q,v){
+  const [x,y,z,w]=q, [vx,vy,vz]=v;
+  const tx=2*(y*vz-z*vy), ty=2*(z*vx-x*vz), tz=2*(x*vy-y*vx);
+  return [vx+w*tx+(y*tz-z*ty), vy+w*ty+(z*tx-x*tz), vz+w*tz+(x*ty-y*tx)];
+}
+function eulerToQ(a,b,g){
+  a*=D2R; b*=D2R; g*=D2R;
+  const cx=Math.cos(b/2), sx=Math.sin(b/2), cy=Math.cos(g/2), sy=Math.sin(g/2), cz=Math.cos(a/2), sz=Math.sin(a/2);
+  return [sx*cy*cz-cx*sy*sz, cx*sy*cz+sx*cy*sz, cx*cy*sz+sx*sy*cz, cx*cy*cz-sx*sy*sz];
+}
+function onQuat(q){
+  const v=qRotate(q, AXES[$('axis').value]);
+  const alt=Math.asin(clamp(v[2],-1,1))*R2D;
+  let az=Math.atan2(v[0],v[1])*R2D + (parseFloat($('decl').value)||0);
+  az=((az%360)+360)%360;
+  att={ok:true, az, alt};
+}
+function startSensors(){
+  if(navigator.geolocation){
+    navigator.geolocation.watchPosition(
+      p=>{ loc={lat:p.coords.latitude, lon:p.coords.longitude, alt:p.coords.altitude||0, acc:p.coords.accuracy}; },
+      e=>{ $('stLoc').textContent='error: '+e.message; },
+      {enableHighAccuracy:true, maximumAge:5000});
+  }
+  let started=false;
+  if('AbsoluteOrientationSensor' in window){
+    try{
+      const s=new AbsoluteOrientationSensor({frequency:20});
+      s.addEventListener('reading',()=>onQuat(s.quaternion));
+      s.addEventListener('error',e=>console.warn('sensor error',e.error));
+      s.start(); started=true;
+    }catch(e){ console.warn(e); }
+  }
+  if(!started){
+    window.addEventListener('deviceorientationabsolute',e=>{
+      if(e.alpha!=null) onQuat(eulerToQ(e.alpha,e.beta,e.gamma));
+    });
+  }
+}
+
+// ---------- Astronomy ----------
+function bodyAltAz(name, date){
+  const obs=new Astronomy.Observer(loc.lat, loc.lon, loc.alt||0);
+  const eq=Astronomy.Equator(name,date,obs,true,true);
+  const h=Astronomy.Horizon(date,obs,eq.ra,eq.dec,'normal');
+  return {az:h.azimuth, alt:h.altitude};
+}
+function sepDeg(a,b){
+  const v=p=>[Math.cos(p.alt*D2R)*Math.sin(p.az*D2R), Math.cos(p.alt*D2R)*Math.cos(p.az*D2R), Math.sin(p.alt*D2R)];
+  const [x,y,z]=v(a),[u,w,t]=v(b);
+  return Math.acos(clamp(x*u+y*w+z*t,-1,1))*R2D;
+}
+function targetNow(){
+  if($('body').value==='manual')
+    return {az:parseFloat($('mAz').value)||0, alt:parseFloat($('mAlt').value)||0, azRate:0, altRate:0};
+  if(!loc) return null;
+  const t0=new Date(), t1=new Date(t0.getTime()+10000), n=$('body').value;
+  const a=bodyAltAz(n,t0), b=bodyAltAz(n,t1);
+  return {az:a.az, alt:a.alt, azRate:wrap180(b.az-a.az)/10, altRate:(b.alt-a.alt)/10};
+}
+function sunSep(t){
+  if(!loc||!t) return null;
+  const s=bodyAltAz('Sun', new Date());
+  return {sep:sepDeg(t,s), sunAlt:s.alt};
+}
+function sunUnsafe(t){
+  const s=sunSep(t);
+  return s && s.sunAlt>-2 && s.sep<15;
+}
+
+// ---------- Actions ----------
+function pushTarget(){
+  const t=targetNow();
+  if(!t) return false;
+  if(sunUnsafe(t)){ stopTracking(); alert('Target is within 15° of the Sun. Tracking stopped.'); return false; }
+  sendTarget(t); return true;
+}
+function startTracking(){
+  if(!est||!est.synced){ if(!confirm('Scope is not aligned yet (no Sync). Track anyway?')) return; }
+  if(!pushTarget()) return;
+  tracking=true; sendMode(2); updateButtons();
+}
+function stopTracking(){ tracking=false; sendMode(0); updateButtons(); }
+
+$('btnConnect').onclick=connect;
+$('btnSensors').onclick=startSensors;
+$('btnTrack').onclick=startTracking;
+$('btnStop').onclick=stopTracking;
+$('btnSyncPhone').onclick=()=>{ if(att.ok) sendSync(att.az,att.alt); };
+$('btnAlign').onclick=()=>{ const t=targetNow(); if(t) sendSync(t.az,t.alt); };
+$('body').onchange=()=>{ $('manualRow').hidden=$('body').value!=='manual'; };
+$('jogSpeed').oninput=()=>{ $('jogPct').textContent=$('jogSpeed').value; };
+$('btnTurbo').onclick=()=>{ turbo=!turbo; $('btnTurbo').classList.toggle('on',turbo); };
+
+document.querySelectorAll('.pad button[data-x]').forEach(b=>{
+  const x=+b.dataset.x, y=+b.dataset.y;
+  const press=e=>{
+    e.preventDefault(); tracking=false; updateButtons();
+    const p=+$('jogSpeed').value;
+    const go=()=>sendJog(x*p,y*p);
+    go(); clearInterval(jogTimer); jogTimer=setInterval(go,100);
+  };
+  const release=()=>{ clearInterval(jogTimer); jogTimer=null; send(new Uint8Array([4,0,0,0]), true); };
+  b.addEventListener('pointerdown',press);
+  b.addEventListener('pointerup',release);
+  b.addEventListener('pointercancel',release);
+  b.addEventListener('pointerleave',()=>{ if(jogTimer) release(); });
+});
+
+function updateButtons(){
+  const c=!!cmdChar;
+  ['btnTrack','btnStop','btnAlign','btnSyncPhone'].forEach(id=>$(id).disabled=!c);
+  $('btnTrack').classList.toggle('on',tracking);
+}
+
+// ---------- Periodic ----------
+setInterval(()=>{ if(cmdChar && att.ok) sendAtt(); },100);       // attitude @10 Hz
+setInterval(()=>{ if(tracking) pushTarget(); },1000);             // target @1 Hz
+setInterval(()=>{
+  $('stTime').textContent=new Date().toISOString().replace('T',' ').slice(0,19);
+  if(loc) $('stLoc').textContent=`${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}  ±${Math.round(loc.acc)} m`;
+  $('stAtt').textContent=att.ok?`${att.az.toFixed(2)}° / ${att.alt.toFixed(2)}°`:'–';
+  if(est){
+    $('stEst').textContent=`${((est.az%360+360)%360).toFixed(3)}° / ${est.alt.toFixed(3)}°` + (est.synced?'':'  (not synced)');
+    $('stMode').textContent=['idle','jog','tracking'][est.mode]||est.mode;
+  }
+  const t=targetNow();
+  if(t){
+    $('stTgt').textContent=`${((t.az%360+360)%360).toFixed(2)}° / ${t.alt.toFixed(2)}°`+(t.alt<0?'  (below horizon)':'');
+    const s=sunSep(t);
+    $('stSun').textContent=s?`${s.sep.toFixed(1)}°`+(s.sunAlt<-2?'  (Sun down)':''):'–';
+  }
+},250);
+updateButtons();
+</script>
+</body>
+</html>

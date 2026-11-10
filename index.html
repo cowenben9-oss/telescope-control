@@ -7,6 +7,7 @@
 <style>
   :root { --bg:#0b0000; --panel:#1a0505; --line:#4a1212; --fg:#ff8a80; --dim:#a24a44; --accent:#ff4d3d; }
   * { box-sizing: border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; padding:12px 16px 40px; background:var(--bg); color:var(--fg);
          font:15px/1.4 system-ui, sans-serif; max-width:520px; margin-inline:auto; }
   h1 { font-size:18px; margin:4px 0 12px; }
@@ -28,6 +29,12 @@
   .warn { color:#ffd180; }
   input[type=range] { width:100%; padding:0; }
   input[type=number] { width:100px; }
+  input[type=checkbox] { width:auto; padding:0; accent-color:var(--accent); vertical-align:middle; margin-right:6px; }
+  label.chk { display:block; margin:4px 0; }
+  .bad { color:#ffd180; font-weight:600; }
+  #calLog { font:12px/1.35 ui-monospace, monospace; color:var(--dim); max-height:150px; overflow-y:auto;
+            white-space:pre-wrap; background:#120303; border:1px solid var(--line); border-radius:8px; padding:6px 8px; margin:8px 0; }
+  #calLog:empty { display:none; }
 </style>
 </head>
 <body>
@@ -112,6 +119,61 @@
   <small class="warn">Never point at the Sun without a proper solar filter. Tracking refuses targets within 15° of the Sun.</small>
 </section>
 
+<section>
+  <h2>Phone / scope sync</h2>
+  <div class="grid" style="margin-bottom:8px">
+    <span>Health</span><span id="stHealth">–</span>
+    <span>Phone − scope alt</span><span id="stDiffAlt">–</span>
+    <span>Phone − scope az</span><span id="stDiffAz">–</span>
+    <span>Corrected since sync</span><span id="stCorr">–</span>
+  </div>
+  <label class="chk"><input type="checkbox" id="cfgAlt" checked>Altitude follows phone (gravity, reliable)</label>
+  <label class="chk"><input type="checkbox" id="cfgAz">Azimuth follows phone (magnetometer, slow, off by default)</label>
+  <label class="chk"><input type="checkbox" id="cfgRecover" checked>Auto-recover slips (up to 10° alt, 20° az)</label>
+  <small>The phone is compared with the step count only while the scope is still or tracking. At each Align/Sync the phone's own error is remembered, so the phone only has to be consistent, not exact. Offsets that are too large are flagged, never chased: re-align on a target.</small>
+</section>
+
+<section>
+  <h2>Gear-ratio calibration</h2>
+  <div class="grid" style="margin-bottom:8px">
+    <span>Az steps/°</span><span id="stCalAz">–</span>
+    <span>Alt steps/°</span><span id="stCalAlt">–</span>
+  </div>
+  <div class="row">
+    <label>Axis
+      <select id="calAxis">
+        <option value="alt">Altitude</option>
+        <option value="azTurn">Azimuth: full 360° turn (best)</option>
+        <option value="azArc">Azimuth: 30° arc (quick, rough)</option>
+      </select>
+    </label>
+    <label>Runs <input id="calRuns" type="number" min="1" max="5" step="1" value="2" style="width:70px"></label>
+  </div>
+  <div class="row" id="calSizeRow">
+    <label>Move size (°) <input id="calSize" type="number" min="2" max="30" step="1" value="10"></label>
+  </div>
+  <div class="row">
+    <button id="btnCalStart" class="primary">Start calibration</button>
+    <button id="btnCalAbort">Abort</button>
+  </div>
+  <div id="calLog"></div>
+  <div id="calResult" hidden>
+    <div class="grid" style="margin-bottom:8px">
+      <span>Measured</span><span id="calMeas">–</span>
+      <span>vs current</span><span id="calVsCur">–</span>
+      <span>Spread</span><span id="calSpread">–</span>
+      <span>Confidence</span><span id="calConf">–</span>
+      <span>Backlash</span><span id="calBacklash">–</span>
+    </div>
+    <div class="row">
+      <button id="btnCalAccept" class="primary">Accept and save</button>
+      <button id="btnCalReject">Reject</button>
+    </div>
+  </div>
+  <div class="row"><button id="btnCalReset">Reset both axes to default ratios</button></div>
+  <small>Keep the phone firmly mounted and don't touch the scope while it runs. Altitude uses the phone's gravity sensor and is the accurate one. For azimuth use the full turn: the magnetometer reads the same after exactly one turn even when the motors distort it, so only the small leftover angle is measured. Check that cables can take a full turn first, and point the tube 10–50° up.</small>
+</section>
+
 <script src="https://cdn.jsdelivr.net/npm/astronomy-engine@2.1.19/astronomy.browser.min.js"></script>
 <script>
 const SVC='b7a10001-5c1e-4f0a-9a3b-7e1d2c3f4a55';
@@ -125,6 +187,9 @@ const wrap180=a=>{a%=360; if(a>180)a-=360; if(a<-180)a+=360; return a;};
 let device=null, cmdChar=null, staChar=null;
 let loc=null, att={ok:false,az:0,alt:0}, est=null, tracking=false, wakeLock=null;
 let turbo=false, jogTimer=null;
+let sync=null, calCfg=null, cfgEditMs=0;          // from status packets 0x81 / 0x82
+let calRun=null, calAbort=false, calPending=null;   // calibration state
+const samples=[];                                  // phone attitude samples while measuring
 
 // ---------- BLE ----------
 let busy=false; const queue=[];
@@ -144,13 +209,18 @@ const sendTarget= t => send(pkt(2,f32(t.az,t.alt,t.azRate,t.altRate)), true);
 const sendAtt   = () => send(pkt(3,f32(att.az,att.alt)));
 const sendSync  = (az,alt) => send(pkt(5,f32(az,alt)), true);
 const sendJog   = (x,y) => send(new Uint8Array([4, x&255, y&255, turbo?1:0]));
+const sendMove  = (dAz,dAlt,speed) => { const dv=new DataView(new ArrayBuffer(13)); dv.setUint8(0,6);
+  dv.setInt32(1,dAz,true); dv.setInt32(5,dAlt,true); dv.setFloat32(9,speed,true); return send(new Uint8Array(dv.buffer), true); };
+const sendSetCal= (az,alt) => send(pkt(7,f32(az,alt)), true);          // <=0 keeps that axis
+const sendResetCal = axes => send(pkt(8,new Uint8Array([axes])), true);  // bit0 az, bit1 alt
+const sendCfg   = f => send(pkt(9,new Uint8Array([f])), true);           // bit0 alt, bit1 az, bit2 recover
 
 async function connect(){
   try{
     device=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
     let connecting=true;
     device.addEventListener('gattserverdisconnected',()=>{
-      cmdChar=null; staChar=null; tracking=false;
+      cmdChar=null; staChar=null; tracking=false; sync=null; calAbort=true;
       if(!connecting) setLink('disconnected');
       updateButtons();
     });
@@ -177,8 +247,18 @@ async function connect(){
     if(!ok) throw lastErr;
     staChar.addEventListener('characteristicvaluechanged',e=>{
       const v=e.target.value;
-      if(v.byteLength>=11 && v.getUint8(0)===0x80){
-        est={az:v.getFloat32(1,true), alt:v.getFloat32(5,true), mode:v.getUint8(9), synced:!!(v.getUint8(10)&1)};
+      const type=v.byteLength?v.getUint8(0):0;
+      if(type===0x80 && v.byteLength>=11){
+        const f=v.getUint8(10);
+        est={az:v.getFloat32(1,true), alt:v.getFloat32(5,true), mode:v.getUint8(9), synced:!!(f&1), warn:!!(f&2)};
+      }else if(type===0x81 && v.byteLength>=19){
+        sync={stepsAz:v.getInt32(1,true), stepsAlt:v.getInt32(5,true),
+              diffAz:v.getInt16(9,true)/100, diffAlt:v.getInt16(11,true)/100,
+              corrAz:v.getInt16(13,true)/100, corrAlt:v.getInt16(15,true)/100,
+              h:v.getUint8(17), m:v.getUint8(18), t:performance.now()};
+      }else if(type===0x82 && v.byteLength>=20){
+        calCfg={az:v.getFloat32(1,true), alt:v.getFloat32(5,true), defAz:v.getFloat32(9,true), defAlt:v.getFloat32(13,true),
+                azDir:v.getInt8(17), altDir:v.getInt8(18), flags:v.getUint8(19)};
       }
     });
     setLink('connected: '+(device.name||'Telescope'));
@@ -207,6 +287,7 @@ function onQuat(q){
   let az=Math.atan2(v[0],v[1])*R2D + (parseFloat($('decl').value)||0);
   az=((az%360)+360)%360;
   att={ok:true, az, alt};
+  if(samples.collecting) samples.push({t:performance.now(), az, alt});
 }
 function startSensors(){
   if(navigator.geolocation){
@@ -285,10 +366,203 @@ $('body').onchange=()=>{ $('manualRow').hidden=$('body').value!=='manual'; };
 $('jogSpeed').oninput=()=>{ $('jogPct').textContent=$('jogSpeed').value; };
 $('btnTurbo').onclick=()=>{ turbo=!turbo; $('btnTurbo').classList.toggle('on',turbo); };
 
+// ---------- Calibration ----------
+// The scope moves by a known number of motor steps; the phone measures the real angle.
+// steps/deg = steps moved / degrees measured. Each leg starts with a small move in the same
+// direction so gear backlash is already taken up, and runs go both ways to average out
+// mount sag and sensor bias.
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function calLog(t){ const el=$('calLog'); el.textContent+=t+'\n'; el.scrollTop=el.scrollHeight; }
+function checkAbort(){ if(calAbort||!cmdChar) throw new Error('aborted'); }
+async function freshStatus(){              // a 0x81 status packet newer than now
+  const t0=performance.now();
+  while(!sync || sync.t<=t0){
+    checkAbort();
+    if(performance.now()-t0>3000) throw new Error('no status from the scope');
+    await sleep(50);
+  }
+  return sync;
+}
+// Average the phone attitude over 2 s windows until it is steady. Azimuth uses a circular mean.
+async function measure(axis){
+  const isAz=axis==='az', thr=isAz?0.4:0.04;
+  for(let tries=0;;tries++){
+    samples.length=0; samples.collecting=true;
+    await sleep(2000);
+    samples.collecting=false; checkAbort();
+    const xs=samples.slice();
+    if(xs.length<10) throw new Error('too few phone samples (are the sensors running?)');
+    let mean, sd;
+    if(isAz){
+      const c=xs.reduce((a,p)=>a+Math.cos(p.az*D2R),0), s=xs.reduce((a,p)=>a+Math.sin(p.az*D2R),0);
+      mean=Math.atan2(s,c)*R2D;
+      sd=Math.sqrt(xs.reduce((a,p)=>a+wrap180(p.az-mean)**2,0)/xs.length);
+    }else{
+      mean=xs.reduce((a,p)=>a+p.alt,0)/xs.length;
+      sd=Math.sqrt(xs.reduce((a,p)=>a+(p.alt-mean)**2,0)/xs.length);
+    }
+    // Sensor-fusion output is smoothed, so neighbouring samples are not independent: be pessimistic.
+    const sem=sd/Math.sqrt(Math.max(1,xs.length/5));
+    if(sd<=thr) return {v:mean, sd, sem};
+    if(tries>=4){ calLog(`  phone still unsteady (±${sd.toFixed(3)}°), using it anyway`); return {v:mean, sd, sem, noisy:true}; }
+    calLog(`  settling (±${sd.toFixed(3)}°)…`);
+  }
+}
+async function moveSteps(dAz,dAlt,speed){
+  await sendMove(dAz,dAlt,speed);
+  const t0=performance.now();
+  await sleep(400);
+  for(;;){
+    const st=await freshStatus();
+    if(!(st.m&1)) break;
+    if(performance.now()-t0>240000) throw new Error('move timed out');
+  }
+  if(sync.m&2) throw new Error('move was clamped by the altitude soft limit or timed out');
+}
+function calPathUnsafe(points){
+  if(!loc) return false;
+  const s=bodyAltAz('Sun', new Date());
+  return s.alt>-2 && points.some(p=>sepDeg(p,s)<15);
+}
+
+async function runCal(){
+  const mode=$('calAxis').value, axis=mode==='alt'?'alt':'az';
+  if(!cmdChar||!att.ok||!calCfg||!sync){ alert('Connect, start the sensors and wait for the scope status first.'); return; }
+  if(!est.synced){
+    if(!confirm('Scope is not aligned. Sync it to the phone attitude now? (Needed for the soft limits and the Sun check.)')) return;
+    sendSync(att.az,att.alt); await sleep(800);
+  }
+  const runs=clamp(parseInt($('calRuns').value)||1,1,5);
+  const cur=axis==='alt'?calCfg.alt:calCfg.az, def=axis==='alt'?calCfg.defAlt:calCfg.defAz;
+  const dir=axis==='alt'?calCfg.altDir:calCfg.azDir;
+  const D=mode==='azTurn'?360:clamp(parseFloat($('calSize').value)||10,2,30);
+  const pre=axis==='alt'?1:2;               // backlash take-up move, deg
+  const speed=mode==='azTurn'?4:axis==='alt'?1:2;
+  const a=est.alt, z=((est.az%360)+360)%360;
+  let sgn=1, path=[];
+  if(axis==='alt'){
+    if(a+pre+D<=89) sgn=1; else if(a-pre-D>=1) sgn=-1;
+    else{ alert(`Not enough room: move the tube so it can travel ${D+pre}° in altitude within 0–90°.`); return; }
+    for(let k=0;k<=D+pre;k++) path.push({az:z, alt:a+sgn*k});
+  }else{
+    if(a<5||a>60||att.alt<5||att.alt>60){ alert('For azimuth, point the tube 10–50° up first (azimuth is meaningless near the zenith).'); return; }
+    const span=mode==='azTurn'?360:D+pre;
+    for(let k=0;k<=span;k+=2) path.push({az:z+k, alt:a});
+    if(mode==='azTurn' && !confirm('The azimuth axis will turn a full 360° and back, about 3 minutes per run. Make sure no cable can snag. Continue?')) return;
+  }
+  if(!loc){ if(!confirm("Location unknown, so the Sun check can't run. Continue only if the Sun is down.")) return; }
+  else if(calPathUnsafe(path)){ alert('The calibration path passes within 15° of the Sun. Refused.'); return; }
+
+  stopTracking();
+  calRun={axis}; calAbort=false; calPending=null; $('calResult').hidden=true; $('calLog').textContent='';
+  updateButtons();
+  const key=axis==='alt'?'stepsAlt':'stepsAz';
+  const mv=deg=>{ const st=Math.round(deg*cur); return moveSteps(axis==='az'?st:0, axis==='alt'?st:0, speed); };
+  const pos=async()=>{ await sleep(1500); const st=await freshStatus(); return {s:st[key], m:await measure(axis)}; };
+  // Measured angle between two positions. The expected angle comes from the steps; the phone
+  // supplies the (small) difference, so a full turn reads as 360° plus the leftover.
+  const ang=(p,q)=>{ const nom=dir*(q.s-p.s)/cur; return nom+wrap180((axis==='alt'?q.m.v-p.m.v:wrap180(q.m.v-p.m.v))-nom); };
+  const legs=[], lash=[];
+  const addLeg=(p,q,label)=>{
+    const deg=ang(p,q), ds=q.s-p.s;
+    if(mode!=='azTurn' && Math.sign(deg)!==Math.sign(dir*ds))
+      throw new Error(`phone moved the opposite way: flip ${axis==='alt'?'ALT_DIR':'AZ_DIR'} in the firmware`);
+    const r=Math.abs(ds/deg), err=Math.hypot(p.m.sem,q.m.sem)/Math.abs(deg);
+    legs.push({r,err}); calLog(`  ${label}: ${ds} steps / ${deg.toFixed(3)}° = ${r.toFixed(2)} steps/°`);
+  };
+  try{
+    calLog(`${mode==='alt'?'Altitude':mode==='azTurn'?'Azimuth full turn':'Azimuth arc'}: ${runs} run(s), ${D}° legs at ${speed}°/s, current ${cur.toFixed(2)} steps/°`);
+    for(let i=1;i<=runs;i++){
+      calLog(`Run ${i}`);
+      await mv(sgn*pre);  const p=await pos();
+      await mv(sgn*D);    const q=await pos(); addLeg(p,q,'forward');
+      await mv(-sgn*pre); const r=await pos();
+      lash.push(pre-Math.abs(ang(q,r)));
+      await mv(-sgn*D);   const t=await pos(); addLeg(r,t,'back');
+    }
+    const n=legs.length, mean=legs.reduce((s,l)=>s+l.r,0)/n;
+    const sdPct=n>1?Math.sqrt(legs.reduce((s,l)=>s+(l.r-mean)**2,0)/(n-1))/mean*100:NaN;
+    const noisePct=Math.sqrt(legs.reduce((s,l)=>s+l.err**2,0))/n*100;
+    const u=Math.max(isNaN(sdPct)?0:sdPct/Math.sqrt(n), noisePct);   // uncertainty of the mean, %
+    const lim=axis==='alt'?[0.15,0.5]:mode==='azTurn'?[0.2,0.6]:[1,3];
+    let conf=u<lim[0]?'good':u<lim[1]?'fair':'poor';
+    // The arc can't see magnetometer distortion from the motors (a few % is typical), so never call it good.
+    if(mode==='azArc' && conf!=='poor') conf='rough only, magnetometer distortion not included; prefer the full turn';
+    const bl=lash.reduce((s,x)=>s+x,0)/lash.length;
+    calPending={axis, value:mean};
+    $('calMeas').textContent=`${mean.toFixed(2)} steps/° (ratio ${(mean*360/51200).toFixed(4)})`;
+    $('calVsCur').textContent=`${((mean/cur-1)*100).toFixed(2)}% vs current, ${((mean/def-1)*100).toFixed(2)}% vs default`;
+    $('calSpread').textContent=(isNaN(sdPct)?'single leg':`±${sdPct.toFixed(2)}% between legs`)+`, sensor noise ±${noisePct.toFixed(2)}%`;
+    $('calConf').innerHTML=conf==='poor'?`<span class="bad">poor (±${u.toFixed(2)}%), rerun with more runs or a larger move</span>`:`${conf} (±${u.toFixed(2)}%)`;
+    $('calBacklash').textContent=axis==='alt'||mode==='azArc'
+      ? (bl>pre*0.8?`≥ ${pre}° (larger than the take-up move, result may be biased)`:`≈ ${Math.max(0,bl).toFixed(2)}°`)
+      : 'not measured (magnetometer too coarse)';
+    if(Math.abs(mean/def-1)>0.15) $('calConf').innerHTML+='<br><span class="bad">More than 15% from the default: the firmware will refuse it. Check the gear ratio and microstepping.</span>';
+    $('calResult').hidden=false;
+    calLog('Done. Accept to save it to the scope, or Reject.');
+  }catch(e){
+    calLog('Stopped: '+e.message);
+    if(cmdChar) sendMode(0);
+  }
+  calRun=null; updateButtons();
+}
+function abortCal(){ calAbort=true; if(cmdChar) sendMode(0); }
+
+$('btnCalStart').onclick=runCal;
+$('btnCalAbort').onclick=abortCal;
+$('btnCalAccept').onclick=()=>{
+  if(!calPending) return;
+  sendSetCal(calPending.axis==='az'?calPending.value:0, calPending.axis==='alt'?calPending.value:0);
+  calLog(`Saved ${calPending.value.toFixed(2)} steps/° for ${calPending.axis}.`);
+  calPending=null; $('calResult').hidden=true;
+};
+$('btnCalReject').onclick=()=>{ calPending=null; $('calResult').hidden=true; calLog('Result rejected, nothing changed.'); };
+$('btnCalReset').onclick=()=>{ if(confirm('Reset both axes to the default gear ratios?')) sendResetCal(3); };
+$('calAxis').onchange=()=>{
+  $('calSizeRow').hidden=$('calAxis').value==='azTurn';
+  $('calSize').value=$('calAxis').value==='alt'?10:20;
+  $('calRuns').value=$('calAxis').value==='azTurn'?1:2;
+};
+
+// ---------- Sync settings and health ----------
+function cfgFlags(){ return ($('cfgAlt').checked?1:0)|($('cfgAz').checked?2:0)|($('cfgRecover').checked?4:0); }
+['cfgAlt','cfgAz','cfgRecover'].forEach(id=>$(id).onchange=()=>{ cfgEditMs=performance.now(); sendCfg(cfgFlags()); });
+const bad=t=>`<span class="bad">${t}</span>`;
+function axisHealth(h,m,lock,slip,recov,noisy,on){
+  if(h&recov) return bad('slip, recovering');
+  if(h&slip) return bad(on?'slip detected':'offset (correction off)');
+  if(m&noisy) return bad('phone noisy');
+  if(h&lock) return on?'locked':'agrees (monitor only)';
+  return on?'checking':'monitor only';
+}
+function showSync(){
+  if(!sync){ ['stHealth','stDiffAlt','stDiffAz','stCorr'].forEach(id=>$(id).textContent='–'); return; }
+  const h=sync.h, m=sync.m, cfg=(m>>2)&7;
+  if(performance.now()-cfgEditMs>3000){ $('cfgAlt').checked=!!(cfg&1); $('cfgAz').checked=!!(cfg&2); $('cfgRecover').checked=!!(cfg&4); }
+  let t;
+  if(!est||!est.synced) t='not aligned yet (use Align or Sync)';
+  else if(!(h&1)) t=bad('no phone data');
+  else if(h&0x80) t=bad('offset too large: re-align on a target');
+  else if(!(m&0x20)) t='learning phone offset (hold still)';
+  else t=`alt ${axisHealth(h,m,2,8,0x20,0x40,cfg&1)}, az ${axisHealth(h,m,4,0x10,0x40,0x80,cfg&2)}`;
+  if(sync.m&1) t='calibration move…';
+  $('stHealth').innerHTML=t;
+  const f=v=>(v>=0?'+':'')+v.toFixed(2)+'°';
+  $('stDiffAlt').textContent=f(sync.diffAlt);
+  $('stDiffAz').textContent=est&&Math.abs(est.alt)>80?'n/a near zenith':f(sync.diffAz);
+  $('stCorr').textContent=`alt ${f(sync.corrAlt)}, az ${f(sync.corrAz)}`;
+}
+function showCal(){
+  if(!calCfg) return;
+  const fmt=(v,d,fl)=>`${v.toFixed(2)} (${fl?'calibrated':'default'}${fl?`, ${((v/d-1)*100).toFixed(2)}%`:''})`;
+  $('stCalAz').textContent=fmt(calCfg.az,calCfg.defAz,calCfg.flags&1);
+  $('stCalAlt').textContent=fmt(calCfg.alt,calCfg.defAlt,calCfg.flags&2);
+}
+
 document.querySelectorAll('.pad button[data-x]').forEach(b=>{
   const x=+b.dataset.x, y=+b.dataset.y;
   const press=e=>{
-    e.preventDefault(); tracking=false; updateButtons();
+    e.preventDefault(); tracking=false; if(calRun) calAbort=true; updateButtons();
     const p=+$('jogSpeed').value;
     const go=()=>sendJog(x*p,y*p);
     go(); clearInterval(jogTimer); jogTimer=setInterval(go,100);
@@ -302,7 +576,9 @@ document.querySelectorAll('.pad button[data-x]').forEach(b=>{
 
 function updateButtons(){
   const c=!!cmdChar;
-  ['btnTrack','btnStop','btnAlign','btnSyncPhone'].forEach(id=>$(id).disabled=!c);
+  ['btnTrack','btnStop','btnAlign','btnSyncPhone','btnCalReset','btnCalAccept'].forEach(id=>$(id).disabled=!c);
+  $('btnCalStart').disabled=!c||!!calRun;
+  $('btnCalAbort').disabled=!calRun;
   $('btnTrack').classList.toggle('on',tracking);
 }
 
@@ -314,9 +590,10 @@ setInterval(()=>{
   if(loc) $('stLoc').textContent=`${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}  ±${Math.round(loc.acc)} m`;
   $('stAtt').textContent=att.ok?`${att.az.toFixed(2)}° / ${att.alt.toFixed(2)}°`:'–';
   if(est){
-    $('stEst').textContent=`${((est.az%360+360)%360).toFixed(3)}° / ${est.alt.toFixed(3)}°` + (est.synced?'':'  (not synced)');
-    $('stMode').textContent=['idle','jog','tracking'][est.mode]||est.mode;
+    $('stEst').textContent=`${((est.az%360+360)%360).toFixed(3)}° / ${est.alt.toFixed(3)}°` + (est.synced?'':'  (not synced)') + (est.warn?'  ⚠ sync':'');
+    $('stMode').textContent=['idle','jog','tracking','calibrating'][est.mode]||est.mode;
   }
+  showSync(); showCal();
   const t=targetNow();
   if(t){
     $('stTgt').textContent=`${((t.az%360+360)%360).toFixed(2)}° / ${t.alt.toFixed(2)}°`+(t.alt<0?'  (below horizon)':'');
